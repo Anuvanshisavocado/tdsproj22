@@ -17,16 +17,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # --- Agent Setup ---
-# This section is configured to use AI Pipe.
-# It reads the AI Pipe token from an environment variable.
 aipipe_token = os.environ.get("AIPIPE_TOKEN")
 aipipe_base_url = "https://aipipe.org/openai/v1"
 
 if not aipipe_token:
     logger.error("AIPIPE_TOKEN environment variable not set.")
-    # In a real server, you'd want robust error handling if the key is missing.
 
-# Initialize the LLM client with the AI Pipe details
 llm = ChatOpenAI(
     model="gpt-4o",
     temperature=0,
@@ -36,7 +32,6 @@ llm = ChatOpenAI(
 
 tools = [python_code_interpreter]
 
-# This is the master prompt that tells the agent how to behave.
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", "You are a world-class data analyst. Your task is to answer questions based on provided files and instructions. You must use the 'python_code_interpreter' tool to perform all of your work. The user's files are available in the tool's current working directory. Your final answer MUST be a single, valid JSON array or object printed to stdout by the tool, as requested in the user's prompt."),
@@ -45,64 +40,67 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-# Create and configure the agent
 agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
 
-# KEY CHANGE HERE: Added @app.post("/") to handle requests to the root URL
+# KEY CHANGE HERE: The function now accepts a single list of files.
 @app.post("/")
 @app.post("/api/")
 async def analyze(
-    questions_file: Annotated[UploadFile, File()],
-    files: List[UploadFile] = File([])
+    files: List[UploadFile] = File(...)
 ):
     """
-    API endpoint that receives data analysis questions and files,
-    then uses a LangChain agent to process them and return an answer.
+    API endpoint that receives a list of files, identifies questions.txt,
+    and uses a LangChain agent to process them.
     """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
 
-    # Use a temporary directory to securely handle file uploads
+    # Find questions.txt and separate it from other data files
+    questions_file = None
+    data_files = []
+    for file in files:
+        if file.filename == 'questions.txt':
+            questions_file = file
+        else:
+            data_files.append(file)
+    
+    if not questions_file:
+        raise HTTPException(status_code=400, detail="Required file 'questions.txt' not found in the upload.")
+
+
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
-        os.chdir(temp_dir) # Change CWD for the agent's tool
+        os.chdir(temp_dir)
 
         try:
-            # Save all uploaded files to the temporary directory
-            file_names = []
-            all_files = [questions_file] + (files or [])
-            for uploaded_file in all_files:
-                file_path = os.path.join(temp_dir, uploaded_file.filename)
-                with open(file_path, "wb") as f:
-                    content = await uploaded_file.read()
-                    f.write(content)
-                
-                # Reset read pointer for questions_file to read it again
-                await uploaded_file.seek(0)
+            # Save all files to the temporary directory
+            all_uploaded_files = [questions_file] + data_files
+            data_file_names = [f.filename for f in data_files]
 
-                if uploaded_file.filename != "questions.txt":
-                    file_names.append(uploaded_file.filename)
+            for uploaded_file in all_uploaded_files:
+                file_path = os.path.join(temp_dir, uploaded_file.filename)
+                content = await uploaded_file.read()
+                with open(file_path, "wb") as f:
+                    f.write(content)
+                await uploaded_file.seek(0) # Reset pointer
 
             questions_content = (await questions_file.read()).decode("utf-8")
             logger.info(f"Received questions:\n{questions_content}")
+            logger.info(f"Received data files: {data_file_names}")
 
-            # Create a detailed input prompt for the agent
             input_prompt = (
                 f"Please answer the following questions:\n\n---\n{questions_content}\n---\n\n"
-                f"The following data files are available in the current directory for your analysis: {file_names}\n\n"
+                f"The following data files are available in the current directory for your analysis: {data_file_names}\n\n"
                 "Generate the final answer in the precise JSON format requested by the questions."
             )
 
-            # Invoke the agent and get the response
             response = await agent_executor.ainvoke({"input": input_prompt})
             
-            # The agent's final output should be the JSON string from the tool
             final_answer_str = response.get("output", "{}")
             logger.info(f"Agent output: {final_answer_str}")
 
-            # Parse the string into a JSON object/array before returning
             return json.loads(final_answer_str)
 
         except json.JSONDecodeError:
@@ -113,5 +111,4 @@ async def analyze(
             logger.error(f"An unexpected error occurred: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
         finally:
-            # IMPORTANT: Restore the original working directory
             os.chdir(original_cwd)
