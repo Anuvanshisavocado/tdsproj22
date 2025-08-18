@@ -55,21 +55,13 @@ async def health_check():
 @app.post("/api/")
 async def analyze(request: Request):
     """
-    Handles POST requests. If files are present, it processes them.
-    If no files are present, it treats it as a simple health check.
+    Handles POST requests. The request MUST contain a 'questions.txt' file.
     """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
 
     form_data = await request.form()
     files = [value for value in form_data.values() if isinstance(value, UploadFile)]
-    
-    # KEY CHANGE HERE: Handle POST requests with no files gracefully.
-    if not files:
-        logger.info("Received POST request without files. Responding with health check.")
-        return {"status": "ok", "message": "Endpoint is ready for file uploads."}
-
-    # --- From here, the logic proceeds only if files were uploaded ---
     
     questions_file = None
     data_files = []
@@ -79,9 +71,12 @@ async def analyze(request: Request):
         else:
             data_files.append(file)
     
+    # KEY CHANGE: This check is now the first thing we do. 
+    # If questions.txt is missing, the request is invalid.
     if not questions_file:
         raise HTTPException(status_code=400, detail="Required file 'questions.txt' not found in the upload.")
 
+    # --- From here, the logic proceeds only if questions.txt was found ---
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
         os.chdir(temp_dir)
