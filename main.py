@@ -2,9 +2,8 @@ import os
 import tempfile
 import json
 import logging
-from fastapi import FastAPI, UploadFile, Request, HTTPException
-from starlette.responses import JSONResponse
-
+from fastapi import FastAPI, UploadFile, Request, HTTPException, Response
+from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
@@ -31,42 +30,72 @@ llm = ChatOpenAI(
 
 tools = [python_code_interpreter]
 
+# Stricter and more detailed system prompt to ensure correct JSON output
 prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", "You are a world-class data analyst. Your task is to answer questions based on provided files and instructions. You must use the 'python_code_interpreter' tool to perform all of your work. The user's files are available in the tool's current working directory. Your final answer MUST be a single, valid JSON array or object printed to stdout by the tool, as requested in the user's prompt."),
+        ("system", """You are a world-class data analyst. Your task is to answer questions based on provided files and instructions.
+You must use the 'python_code_interpreter' tool to perform all of your work.
+The user's files are available in the tool's current working directory.
+Your final answer MUST be a single, valid JSON object or array printed to stdout.
+
+CRITICAL INSTRUCTIONS:
+1. Your final JSON output MUST contain all required keys specified in the user's question. Do not omit any keys.
+2. For any questions that require a plot or image, the value must be a correctly formatted base64 PNG string, like "data:image/png;base64,...".
+3. The base64 string must be less than 100,000 bytes.
+4. If a value cannot be calculated, you must still include the key with a null or appropriate default value (e.g., "correlation": null).
+"""),
         ("human", "{input}"),
         ("placeholder", "{agent_scratchpad}"),
     ]
 )
 
 agent = create_tool_calling_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    handle_parsing_errors=True
+)
+
 
 @app.get("/")
 @app.get("/api/")
 async def health_check():
+    """Simple health check returning status ok."""
     return {"status": "ok"}
+
 
 @app.post("/")
 @app.post("/api/")
 async def analyze(request: Request):
+    """
+    Handles POST requests.
+    Detects and handles probe requests with no questions.txt by returning HTTP 204.
+    """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
 
+    content_type = request.headers.get('content-type', '')
+    if 'multipart/form-data' not in content_type:
+        logger.info("Received non-multipart POST request; sending status ok.")
+        return {"status": "ok", "message": "Endpoint ready for multipart file uploads."}
+
     form_data = await request.form()
     files = [value for value in form_data.values() if isinstance(value, UploadFile)]
-    
+
     questions_file = None
     data_files = []
+
     for file in files:
-        # FINAL FIX: Check for both 'questions.txt' and 'question.txt'
         if hasattr(file, 'filename') and file.filename in ('questions.txt', 'question.txt'):
             questions_file = file
         elif hasattr(file, 'filename'):
             data_files.append(file)
-    
+
     if not questions_file:
-        raise HTTPException(status_code=400, detail="A file named 'questions.txt' or 'question.txt' was not found in the upload.")
+        logger.info("No questions.txt found in upload; treating as probe. Returning 204 No Content.")
+        return Response(status_code=204)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
@@ -95,15 +124,18 @@ async def analyze(request: Request):
             response = await agent_executor.ainvoke({"input": input_prompt})
             final_answer_str = response.get("output", "{}")
             logger.info(f"Agent output: {final_answer_str}")
-            
+
             return JSONResponse(content=json.loads(final_answer_str))
 
         except json.JSONDecodeError:
             error_msg = f"Agent returned a non-JSON output: {final_answer_str}"
             logger.error(error_msg)
             raise HTTPException(status_code=500, detail=error_msg)
+
         except Exception as e:
             logger.error(f"An unexpected error occurred: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
         finally:
             os.chdir(original_cwd)
+
