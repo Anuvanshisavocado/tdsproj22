@@ -2,18 +2,13 @@ import os
 import tempfile
 import json
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from typing import List, Annotated
 
-# Make sure to install these: pip install langchain langchain-openai
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
 from tools import python_code_interpreter
-
-# --- IMPORTANT: Set your OpenAI API Key ---
-# Best practice is to set this as an environment variable
-# os.environ["OPENAI_API_KEY"] = "sk-..."
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,11 +17,27 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # --- Agent Setup ---
-# Use a powerful model capable of complex reasoning and tool use (e.g., gpt-4o, gpt-4-turbo)
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+# This section is now configured to use AI Pipe instead of OpenAI directly.
+# It reads the AI Pipe token from an environment variable.
+aipipe_token = os.environ.get("AIPIPE_TOKEN")
+aipipe_base_url = "https://aipipe.org/openai/v1"
+
+if not aipipe_token:
+    logger.error("AIPIPE_TOKEN environment variable not set.")
+    # You can raise an error here or handle it as needed
+    # For a server, it's better to log and let it fail on request
+
+# Initialize the LLM client with the AI Pipe details
+llm = ChatOpenAI(
+    model="gpt-4o",
+    temperature=0,
+    api_key=aipipe_token,
+    base_url=aipipe_base_url
+)
+
 tools = [python_code_interpreter]
 
-# This is the master prompt that tells the agent how to behave
+# This is the master prompt that tells the agent how to behave.
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", "You are a world-class data analyst. Your task is to answer questions based on provided files and instructions. You must use the 'python_code_interpreter' tool to perform all of your work. The user's files are available in the tool's current working directory. Your final answer MUST be a single, valid JSON array or object printed to stdout by the tool, as requested in the user's prompt."),
@@ -42,8 +53,15 @@ agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_pa
 @app.post("/api/")
 async def analyze(
     questions_file: Annotated[UploadFile, File()],
-    files: List[UploadFile] = File([]) # Use an empty list as default for optional files
+    files: List[UploadFile] = File([])
 ):
+    """
+    API endpoint that receives data analysis questions and files,
+    then uses a LangChain agent to process them and return an answer.
+    """
+    if not aipipe_token:
+        raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
+
     # Use a temporary directory to securely handle file uploads
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
@@ -52,14 +70,19 @@ async def analyze(
         try:
             # Save all uploaded files to the temporary directory
             file_names = []
-            all_files = [questions_file] + files
+            all_files = [questions_file] + (files or [])
             for uploaded_file in all_files:
                 file_path = os.path.join(temp_dir, uploaded_file.filename)
                 with open(file_path, "wb") as f:
-                    f.write(await uploaded_file.read())
+                    content = await uploaded_file.read()
+                    f.write(content)
+                
+                # Reset read pointer for questions_file if we need to read it again
+                await uploaded_file.seek(0)
+
                 if uploaded_file.filename != "questions.txt":
                     file_names.append(uploaded_file.filename)
-            
+
             questions_content = (await questions_file.read()).decode("utf-8")
             logger.info(f"Received questions:\n{questions_content}")
 
@@ -81,7 +104,6 @@ async def analyze(
             return json.loads(final_answer_str)
 
         except json.JSONDecodeError:
-            # Handle cases where the LLM output is not valid JSON
             error_msg = f"Agent returned a non-JSON output: {final_answer_str}"
             logger.error(error_msg)
             raise HTTPException(status_code=500, detail=error_msg)
