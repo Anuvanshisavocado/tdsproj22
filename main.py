@@ -2,7 +2,7 @@ import os
 import tempfile
 import json
 import logging
-from fastapi import FastAPI, UploadFile, Request, HTTPException, Response
+from fastapi import FastAPI, UploadFile, Request, HTTPException
 from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -30,20 +30,17 @@ llm = ChatOpenAI(
 
 tools = [python_code_interpreter]
 
-# Stricter and more detailed system prompt to ensure correct JSON output
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", """You are a world-class data analyst. Your task is to answer questions based on provided files and instructions.
 You must use the 'python_code_interpreter' tool to perform all of your work.
 The user's files are available in the tool's current working directory.
 Your final answer MUST be a single, valid JSON object or array printed to stdout.
-
 CRITICAL INSTRUCTIONS:
-1. Your final JSON output MUST contain all required keys specified in the user's question. Do not omit any keys.
-2. For any questions that require a plot or image, the value must be a correctly formatted base64 PNG string, like "data:image/png;base64,...".
-3. The base64 string must be less than 100,000 bytes.
-4. If a value cannot be calculated, you must still include the key with a null or appropriate default value (e.g., "correlation": null).
-"""),
+1.  Your final JSON output MUST contain all required keys specified in the user's question. Do not omit any keys.
+2.  For any questions that require a plot or image, the value must be a correctly formatted base64 PNG string, like "data:image/png;base64,...".
+3.  The base64 string must be less than 100,000 bytes.
+4.  If a value cannot be calculated, you must still include the key with a null or appropriate default value (e.g., "correlation": null)."""),
         ("human", "{input}"),
         ("placeholder", "{agent_scratchpad}"),
     ]
@@ -58,44 +55,36 @@ agent_executor = AgentExecutor(
     handle_parsing_errors=True
 )
 
-
 @app.get("/")
 @app.get("/api/")
 async def health_check():
-    """Simple health check returning status ok."""
     return {"status": "ok"}
-
 
 @app.post("/")
 @app.post("/api/")
 async def analyze(request: Request):
-    """
-    Handles POST requests.
-    Detects and handles probe requests with no questions.txt by returning HTTP 204.
-    """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
-
     content_type = request.headers.get('content-type', '')
     if 'multipart/form-data' not in content_type:
-        logger.info("Received non-multipart POST request; sending status ok.")
-        return {"status": "ok", "message": "Endpoint ready for multipart file uploads."}
-
+        logger.info("Received a non-multipart POST request. Treating as health check.")
+        return {"status": "ok", "message": "Endpoint is ready for multipart file uploads."}
+    
     form_data = await request.form()
     files = [value for value in form_data.values() if isinstance(value, UploadFile)]
-
+    
     questions_file = None
     data_files = []
-
     for file in files:
         if hasattr(file, 'filename') and file.filename in ('questions.txt', 'question.txt'):
             questions_file = file
         elif hasattr(file, 'filename'):
             data_files.append(file)
 
+    # If no questions.txt found, return empty JSON so evaluator doesn't error
     if not questions_file:
-        logger.info("No questions.txt found in upload; treating as probe. Returning 204 No Content.")
-        return Response(status_code=204)
+        logger.info("Received POST without 'questions.txt'. Assuming probe. Returning empty JSON.")
+        return JSONResponse(content={})
 
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
@@ -103,28 +92,28 @@ async def analyze(request: Request):
         try:
             all_uploaded_files = [questions_file] + data_files
             data_file_names = [f.filename for f in data_files]
-
+            
             for uploaded_file in all_uploaded_files:
                 file_path = os.path.join(temp_dir, uploaded_file.filename)
                 content = await uploaded_file.read()
                 with open(file_path, "wb") as f:
                     f.write(content)
                 await uploaded_file.seek(0)
-
+            
             questions_content = (await questions_file.read()).decode("utf-8")
             logger.info(f"Received questions:\n{questions_content}")
             logger.info(f"Received data files: {data_file_names}")
-
+            
             input_prompt = (
                 f"Please answer the following questions:\n\n---\n{questions_content}\n---\n\n"
                 f"The following data files are available in the current directory for your analysis: {data_file_names}\n\n"
                 "Generate the final answer in the precise JSON format requested by the questions."
             )
-
+            
             response = await agent_executor.ainvoke({"input": input_prompt})
             final_answer_str = response.get("output", "{}")
             logger.info(f"Agent output: {final_answer_str}")
-
+            
             return JSONResponse(content=json.loads(final_answer_str))
 
         except json.JSONDecodeError:
@@ -138,4 +127,3 @@ async def analyze(request: Request):
 
         finally:
             os.chdir(original_cwd)
-
