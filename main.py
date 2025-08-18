@@ -17,15 +17,14 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # --- Agent Setup ---
-# This section is now configured to use AI Pipe instead of OpenAI directly.
+# This section is configured to use AI Pipe.
 # It reads the AI Pipe token from an environment variable.
 aipipe_token = os.environ.get("AIPIPE_TOKEN")
 aipipe_base_url = "https://aipipe.org/openai/v1"
 
 if not aipipe_token:
     logger.error("AIPIPE_TOKEN environment variable not set.")
-    # You can raise an error here or handle it as needed
-    # For a server, it's better to log and let it fail on request
+    # In a real server, you'd want robust error handling if the key is missing.
 
 # Initialize the LLM client with the AI Pipe details
 llm = ChatOpenAI(
@@ -50,6 +49,9 @@ prompt = ChatPromptTemplate.from_messages(
 agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
+
+# KEY CHANGE HERE: Added @app.post("/") to handle requests to the root URL
+@app.post("/")
 @app.post("/api/")
 async def analyze(
     questions_file: Annotated[UploadFile, File()],
@@ -77,7 +79,7 @@ async def analyze(
                     content = await uploaded_file.read()
                     f.write(content)
                 
-                # Reset read pointer for questions_file if we need to read it again
+                # Reset read pointer for questions_file to read it again
                 await uploaded_file.seek(0)
 
                 if uploaded_file.filename != "questions.txt":
