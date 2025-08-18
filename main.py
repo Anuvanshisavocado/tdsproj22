@@ -44,35 +44,33 @@ agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
 
-# NEW: Added a simple GET endpoint for health checks.
 @app.get("/")
 @app.get("/api/")
 async def health_check():
-    """Provides a simple health check endpoint."""
+    """Provides a simple health check endpoint for GET requests."""
     return {"status": "ok"}
 
 
-# MODIFIED: The POST endpoint now handles dynamic file fields.
 @app.post("/")
 @app.post("/api/")
 async def analyze(request: Request):
     """
-    API endpoint that reads all files from a multipart request,
-    identifies questions.txt, and uses a LangChain agent to process them.
+    Handles POST requests. If files are present, it processes them.
+    If no files are present, it treats it as a simple health check.
     """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
 
-    try:
-        form_data = await request.form()
-        files = [value for value in form_data.values() if isinstance(value, UploadFile)]
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid form data; could not parse files.")
+    form_data = await request.form()
+    files = [value for value in form_data.values() if isinstance(value, UploadFile)]
     
+    # KEY CHANGE HERE: Handle POST requests with no files gracefully.
     if not files:
-        raise HTTPException(status_code=400, detail="No files were uploaded.")
+        logger.info("Received POST request without files. Responding with health check.")
+        return {"status": "ok", "message": "Endpoint is ready for file uploads."}
 
-    # Find questions.txt and separate it from other data files
+    # --- From here, the logic proceeds only if files were uploaded ---
+    
     questions_file = None
     data_files = []
     for file in files:
@@ -89,7 +87,6 @@ async def analyze(request: Request):
         os.chdir(temp_dir)
 
         try:
-            # Save all files to the temporary directory
             all_uploaded_files = [questions_file] + data_files
             data_file_names = [f.filename for f in data_files]
 
@@ -98,7 +95,7 @@ async def analyze(request: Request):
                 content = await uploaded_file.read()
                 with open(file_path, "wb") as f:
                     f.write(content)
-                await uploaded_file.seek(0) # Reset pointer
+                await uploaded_file.seek(0)
 
             questions_content = (await questions_file.read()).decode("utf-8")
             logger.info(f"Received questions:\n{questions_content}")
