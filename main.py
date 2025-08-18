@@ -2,8 +2,8 @@ import os
 import tempfile
 import json
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from typing import List, Annotated
+from fastapi import FastAPI, UploadFile, Request, HTTPException
+from typing import List
 
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -44,18 +44,33 @@ agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
 
-# KEY CHANGE HERE: The function now accepts a single list of files.
+# NEW: Added a simple GET endpoint for health checks.
+@app.get("/")
+@app.get("/api/")
+async def health_check():
+    """Provides a simple health check endpoint."""
+    return {"status": "ok"}
+
+
+# MODIFIED: The POST endpoint now handles dynamic file fields.
 @app.post("/")
 @app.post("/api/")
-async def analyze(
-    files: List[UploadFile] = File(...)
-):
+async def analyze(request: Request):
     """
-    API endpoint that receives a list of files, identifies questions.txt,
-    and uses a LangChain agent to process them.
+    API endpoint that reads all files from a multipart request,
+    identifies questions.txt, and uses a LangChain agent to process them.
     """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
+
+    try:
+        form_data = await request.form()
+        files = [value for value in form_data.values() if isinstance(value, UploadFile)]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid form data; could not parse files.")
+    
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
 
     # Find questions.txt and separate it from other data files
     questions_file = None
@@ -68,7 +83,6 @@ async def analyze(
     
     if not questions_file:
         raise HTTPException(status_code=400, detail="Required file 'questions.txt' not found in the upload.")
-
 
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
