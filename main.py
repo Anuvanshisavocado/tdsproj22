@@ -3,7 +3,7 @@ import tempfile
 import json
 import logging
 from fastapi import FastAPI, UploadFile, Request, HTTPException
-from typing import List
+from starlette.responses import JSONResponse
 
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -55,32 +55,40 @@ async def health_check():
 @app.post("/api/")
 async def analyze(request: Request):
     """
-    Handles POST requests. The request MUST contain a 'questions.txt' file.
+    Handles POST requests. It distinguishes between real file uploads
+    and simple probe requests by checking the content-type.
     """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
-
-    form_data = await request.form()
-    files = [value for value in form_data.values() if isinstance(value, UploadFile)]
     
+    # FINAL FIX: Check the content-type to ignore probe requests.
+    content_type = request.headers.get('content-type', '')
+    if 'multipart/form-data' not in content_type:
+        logger.info(f"Received a non-multipart POST request. Treating as health check.")
+        return {"status": "ok", "message": "Endpoint is ready for multipart file uploads."}
+
+    # --- From here, the logic proceeds only if it's a real file upload ---
+    try:
+        form_data = await request.form()
+        files = [value for value in form_data.values() if isinstance(value, UploadFile)]
+    except Exception as e:
+        logger.error(f"Could not parse form data: {e}")
+        raise HTTPException(status_code=400, detail="Invalid or malformed multipart/form-data request.")
+
     questions_file = None
     data_files = []
     for file in files:
-        if file.filename == 'questions.txt':
+        if hasattr(file, 'filename') and file.filename == 'questions.txt':
             questions_file = file
-        else:
+        elif hasattr(file, 'filename'):
             data_files.append(file)
     
-    # KEY CHANGE: This check is now the first thing we do. 
-    # If questions.txt is missing, the request is invalid.
     if not questions_file:
-        raise HTTPException(status_code=400, detail="Required file 'questions.txt' not found in the upload.")
+        raise HTTPException(status_code=400, detail="Required file 'questions.txt' not found in the multipart upload.")
 
-    # --- From here, the logic proceeds only if questions.txt was found ---
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
         os.chdir(temp_dir)
-
         try:
             all_uploaded_files = [questions_file] + data_files
             data_file_names = [f.filename for f in data_files]
@@ -103,11 +111,11 @@ async def analyze(request: Request):
             )
 
             response = await agent_executor.ainvoke({"input": input_prompt})
-            
             final_answer_str = response.get("output", "{}")
             logger.info(f"Agent output: {final_answer_str}")
-
-            return json.loads(final_answer_str)
+            
+            # The agent's output is a string, which we parse into JSON and let FastAPI handle serialization
+            return JSONResponse(content=json.loads(final_answer_str))
 
         except json.JSONDecodeError:
             error_msg = f"Agent returned a non-JSON output: {final_answer_str}"
