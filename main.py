@@ -2,7 +2,7 @@ import os
 import tempfile
 import json
 import logging
-from fastapi import FastAPI, UploadFile, Request, HTTPException, Response
+from fastapi import FastAPI, UploadFile, Request, HTTPException
 from starlette.responses import JSONResponse
 
 from langchain_openai import ChatOpenAI
@@ -10,7 +10,6 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
 from tools import python_code_interpreter
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -43,21 +42,14 @@ prompt = ChatPromptTemplate.from_messages(
 agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
-
 @app.get("/")
 @app.get("/api/")
 async def health_check():
-    """Provides a simple health check endpoint for GET requests."""
     return {"status": "ok"}
-
 
 @app.post("/")
 @app.post("/api/")
 async def analyze(request: Request):
-    """
-    Handles POST requests. Distinguishes between real file uploads
-    and probe requests by checking for 'questions.txt'.
-    """
     if not aipipe_token:
         raise HTTPException(status_code=500, detail="Server is not configured with an AIPIPE_TOKEN.")
 
@@ -67,17 +59,15 @@ async def analyze(request: Request):
     questions_file = None
     data_files = []
     for file in files:
-        if hasattr(file, 'filename') and file.filename == 'questions.txt':
+        # FINAL FIX: Check for both 'questions.txt' and 'question.txt'
+        if hasattr(file, 'filename') and file.filename in ('questions.txt', 'question.txt'):
             questions_file = file
         elif hasattr(file, 'filename'):
             data_files.append(file)
     
-    # FINAL FIX: If questions.txt is missing, return a 204 No Content status.
     if not questions_file:
-        logger.info("Received POST without 'questions.txt'. Assuming probe. Returning 204 No Content.")
-        return Response(status_code=204)
+        raise HTTPException(status_code=400, detail="A file named 'questions.txt' or 'question.txt' was not found in the upload.")
 
-    # --- From here, the logic proceeds only if it's the real data request ---
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
         os.chdir(temp_dir)
