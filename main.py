@@ -2,8 +2,8 @@ import os
 import tempfile
 import json
 import logging
-from fastapi import FastAPI, UploadFile, Request, HTTPException, File
-from starlette.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
 from typing import List
 
 from langchain_openai import ChatOpenAI
@@ -17,37 +17,38 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # --- Agent Setup ---
-openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
-openrouter_base_url = "https://openrouter.ai/api/v1"
 
-if not openrouter_api_key:
-    logger.error("OPENROUTER_API_KEY environment variable not set.")
+aipipe_token = os.environ.get("AIPIPE_TOKEN")
+aipipe_base_url = "https://aipipe.org/openai/v1"
+
+if not aipipe_token:
+    logger.error("AIPIPE_TOKEN environment variable not set.")
 
 llm = ChatOpenAI(
-    model="openai/gpt-4o",
+    model="gpt-4o",  # or your preferred AIPipe-supported model
     temperature=0,
-    api_key="placeholder",
-    base_url=openrouter_base_url,
-    default_headers={
-        "Authorization": f"Bearer {openrouter_api_key}",
-        "HTTP-Referer": "https://github.com/your-repo", # Optional: Replace with your repo URL
-        "X-Title": "TDS Data Analyst Agent",
-    }
+    api_key=aipipe_token,
+    base_url=aipipe_base_url,
 )
 
 tools = [python_code_interpreter]
 
 prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", """You are a world-class data analyst. Your task is to answer questions based on provided files and instructions.
-You must use the 'python_code_interpreter' tool to perform all of your work.
-Your final answer MUST be a single, valid JSON object or array printed to stdout that strictly matches the schema requested by the user.
+        ("system", """You are a world-class data analyst. Your primary goal is to answer the user's questions by writing and executing Python code.
 
-CRITICAL INSTRUCTIONS:
-1.  Your final JSON output MUST contain all required keys specified in the user's question. Do not omit any keys.
-2.  For any questions that require a plot or image, the value must be a correctly formatted base64 PNG string, like "data:image/png;base64,...".
-3.  The base64 string must be less than 100,000 bytes.
-4.  If a value cannot be calculated, you must still include the key with a null or appropriate default value."""),
+
+**Your workflow is as follows:**
+1. Analyze the Request: Understand the user's questions and the data files provided.
+2. Plan Your Steps: Think step-by-step to produce all parts of the answer.
+3. Execute Code: Use the 'python_code_interpreter' tool repeatedly as needed.
+4. Final Output: Your absolute final action must be to output a single, valid JSON object or array containing the complete response. Do NOT output any other text or notes.
+
+
+**IMPORTANT:**
+- Your final JSON must contain all required keys specified in the user's questions.
+- If any value cannot be computed, include the key with null or appropriate default.
+- For any images/charts, base64 strings must begin with "data:image/png;base64," and be under 100k bytes."""),
         ("human", "{input}"),
         ("placeholder", "{agent_scratchpad}"),
     ]
@@ -56,6 +57,16 @@ CRITICAL INSTRUCTIONS:
 agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
+fallback_result = {
+    "total_sales": None,
+    "top_region": None,
+    "day_sales_correlation": None,
+    "bar_chart": "",
+    "median_sales": None,
+    "total_sales_tax": None,
+    "cumulative_sales_chart": ""
+}
+
 @app.get("/")
 @app.get("/api/")
 async def health_check():
@@ -63,59 +74,56 @@ async def health_check():
 
 @app.post("/")
 @app.post("/api/")
-async def analyze(request: Request):
-    if not openrouter_api_key:
-        raise HTTPException(status_code=500, detail="Server is not configured with an OPENROUTER_API_KEY.")
+async def analyze(
+    questions_file: UploadFile = File(...),
+    other_files: List[UploadFile] = File(default=[])
+):
+    if not aipipe_token:
+        return JSONResponse(status_code=500, content={"detail": "Server is not configured with an AIPIPE_TOKEN."})
 
-    form_data = await request.form()
-    files = [value for value in form_data.values() if isinstance(value, UploadFile)]
-    
-    questions_file = None
-    data_files = []
-    for file in files:
-        if hasattr(file, 'filename') and file.filename in ('questions.txt', 'question.txt'):
-            questions_file = file
-        elif hasattr(file, 'filename'):
-            data_files.append(file)
-    
-    # Universal handler for probe requests: return an empty, valid JSON.
-    if not questions_file:
-        logger.info("Received POST without 'questions.txt'. Assuming probe. Returning empty JSON.")
-        return JSONResponse(content={})
+    data_files = other_files
+    all_files = [questions_file] + data_files
 
     with tempfile.TemporaryDirectory() as temp_dir:
         original_cwd = os.getcwd()
         os.chdir(temp_dir)
         try:
-            all_uploaded_files = [questions_file] + data_files
             data_file_names = [f.filename for f in data_files]
-
-            for uploaded_file in all_uploaded_files:
+            for uploaded_file in all_files:
                 file_path = os.path.join(temp_dir, uploaded_file.filename)
                 content = await uploaded_file.read()
                 with open(file_path, "wb") as f:
                     f.write(content)
                 await uploaded_file.seek(0)
 
-            questions_content = (await uploaded_file.read()).decode("utf-8")
+            questions_content = (await questions_file.read()).decode("utf-8")
             input_prompt = (
-                f"Please answer the following questions:\n\n---\n{questions_content}\n---\n\n"
-                f"The following data files are available for your analysis: {data_file_names}"
+                f"Questions:\n{questions_content}\n\n"
+                f"Available data files: {data_file_names}"
             )
 
+            logger.info(f"Running agent with prompt:\n{input_prompt}")
+
             response = await agent_executor.ainvoke({"input": input_prompt})
-            final_answer_str = response.get("output", "{}")
+
+            final_answer_str = response.get("output") if isinstance(response, dict) else response
+
+            if not final_answer_str or not isinstance(final_answer_str, str):
+                logger.error(f"Agent returned invalid output: {final_answer_str}")
+                return JSONResponse(content=fallback_result)
+
             logger.info(f"Agent output: {final_answer_str}")
-            
+
             try:
                 final_content = json.loads(final_answer_str)
                 return JSONResponse(content=final_content)
             except json.JSONDecodeError:
-                logger.error(f"Agent returned a non-JSON output: {final_answer_str}")
-                return JSONResponse(content={}, status_code=500) # Return empty JSON on agent failure
+                logger.error(f"Agent returned invalid JSON: {final_answer_str}")
+                return JSONResponse(content=fallback_result)
 
         except Exception as e:
-            logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-            return JSONResponse(content={}, status_code=500) # Return empty JSON on system failure
+            logger.error(f"Unexpected error in analyze endpoint: {e}", exc_info=True)
+            return JSONResponse(content={"detail": f"Internal server error: {e}"}, status_code=500)
         finally:
+            # Restore original working directory
             os.chdir(original_cwd)
