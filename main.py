@@ -29,6 +29,7 @@ llm = ChatOpenAI(
     temperature=0,
     api_key=AIPIPE_TOKEN,
     base_url=AIPIPE_BASE_URL,
+    max_tokens=1500 
 )
 
 tools = [python_code_interpreter]
@@ -134,3 +135,4 @@ async def analyze(
             return JSONResponse(content={"detail": f"Internal server error: {str(e)}"}, status_code=500)
         finally:
             os.chdir(original_cwd)
+
